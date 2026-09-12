@@ -1,9 +1,19 @@
 """
 modules/risk_scorer.py — CVSS-based Risk Scoring Engine
-Calculates CVSS base scores for each finding and an overall risk score.
+
+Calculates CVSS base scores for findings and produces
+an overall risk summary.
+
+Important:
+- Uses CVSS score supplied by a scanner when available.
+- Uses CVSS v3 vector when available.
+- Does NOT assign an artificially high CVSS score to findings
+  just because their severity label is high.
+- Scanner severity is preserved when no real CVSS score exists.
 """
+
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 try:
     from cvss import CVSS3
@@ -11,156 +21,553 @@ try:
 except ImportError:
     CVSS_AVAILABLE = False
 
+
 logger = logging.getLogger("assessor.risk_scorer")
 
-# Fallback scores when CVSS cannot be computed
+
+# ---------------------------------------------------------
+# Fallback scores
+# ---------------------------------------------------------
+#
+# These are conservative representative scores used only
+# when a finding has no actual CVSS score/vector.
+#
+# They should NOT be interpreted as official CVSS scores.
+#
+
 FALLBACK_SCORES = {
-    "CRITICAL": 9.5,
-    "HIGH":     8.0,
-    "MEDIUM":   5.5,
-    "LOW":      2.5,
-    "INFO":     0.0,
+    "CRITICAL": 9.0,
+    "HIGH": 7.0,
+    "MEDIUM": 4.0,
+    "LOW": 0.1,
+    "INFO": 0.0,
 }
 
 
+# ---------------------------------------------------------
+# Severity order
+# ---------------------------------------------------------
 
+SEVERITY_ORDER = {
+    "CRITICAL": 0,
+    "HIGH": 1,
+    "MEDIUM": 2,
+    "LOW": 3,
+    "INFO": 4,
+}
+
+
+# ---------------------------------------------------------
+# Score a single finding
+# ---------------------------------------------------------
 
 def score_finding(finding: Dict) -> Dict:
     """
-    Calculate CVSS base score for a single finding.
-    Adds 'cvss_base_score' and 'cvss_severity' to the finding dict.
-    Synchronizes 'severity' with 'cvss_severity' for consistent classification.
-    Returns updated finding dict.
+    Calculate a CVSS base score for one finding.
+
+    Priority:
+
+    1. Explicit CVSS score supplied by the scanner.
+    2. CVSS v3 vector supplied by the scanner.
+    3. Conservative fallback based on scanner severity.
+
+    The original scanner severity is preserved in:
+        original_severity
+
+    The calculated severity is stored in:
+        cvss_severity
+
+    If a real CVSS score/vector exists, severity is synchronized
+    with the calculated CVSS severity.
+
+    If no real CVSS information exists, the original scanner
+    severity is preserved.
     """
+
     finding = dict(finding)
-    vector = finding.get("cvss_vector", "")
-    orig_severity = str(finding.get("severity", "INFO")).upper()
-    if orig_severity not in FALLBACK_SCORES:
-        orig_severity = "INFO"
-    finding["original_severity"] = orig_severity
 
-    base_score = None
+    # -----------------------------------------------------
+    # Original severity
+    # -----------------------------------------------------
 
-    # Priority 1: Explicit score provided by tool (e.g. Nuclei)
-    if finding.get("cvss_score") is not None:
+    original_severity = str(
+        finding.get("severity", "INFO")
+    ).upper()
+
+    if original_severity not in SEVERITY_ORDER:
+        original_severity = "INFO"
+
+    finding["original_severity"] = original_severity
+
+    # -----------------------------------------------------
+    # Get CVSS information
+    # -----------------------------------------------------
+
+    vector = finding.get(
+        "cvss_vector",
+        ""
+    )
+
+    if vector is None:
+        vector = ""
+
+    vector = str(vector).strip()
+
+    explicit_score = finding.get(
+        "cvss_score",
+        None
+    )
+
+    base_score: Optional[float] = None
+
+    score_source = "fallback"
+
+    # -----------------------------------------------------
+    # Priority 1:
+    # Explicit CVSS score from scanner
+    # -----------------------------------------------------
+
+    if explicit_score is not None:
+
         try:
-            base_score = float(finding["cvss_score"])
-        except (ValueError, TypeError):
-            pass
 
-    # Priority 2: Calculate from CVSS v3 vector if not explicitly set
-    if base_score is None and CVSS_AVAILABLE and vector and vector.startswith("CVSS:3"):
+            parsed_score = float(
+                explicit_score
+            )
+
+            if 0.0 <= parsed_score <= 10.0:
+
+                base_score = parsed_score
+                score_source = "scanner"
+
+        except (
+            ValueError,
+            TypeError
+        ):
+
+            logger.debug(
+                f"Invalid CVSS score: {explicit_score}"
+            )
+
+    # -----------------------------------------------------
+    # Priority 2:
+    # Calculate from CVSS v3 vector
+    # -----------------------------------------------------
+
+    if (
+        base_score is None
+        and CVSS_AVAILABLE
+        and vector
+        and vector.upper().startswith("CVSS:3")
+    ):
+
         try:
-            c = CVSS3(vector)
-            base_score = float(c.base_score)
-        except Exception as e:
-            logger.debug(f"CVSS parse error for vector '{vector}': {e}")
 
-    # Priority 3: Fallback based on severity
+            cvss = CVSS3(vector)
+
+            base_score = float(
+                cvss.base_score
+            )
+
+            score_source = "vector"
+
+        except Exception as exc:
+
+            logger.debug(
+                f"CVSS vector parse error "
+                f"'{vector}': {exc}"
+            )
+
+    # -----------------------------------------------------
+    # Priority 3:
+    # Conservative fallback
+    # -----------------------------------------------------
+
     if base_score is None:
-        base_score = FALLBACK_SCORES.get(orig_severity, 0.0)
 
-    # Map score back to severity label
-    cvss_severity = _score_to_severity(base_score)
+        base_score = FALLBACK_SCORES.get(
+            original_severity,
+            0.0
+        )
 
-    finding["cvss_base_score"] = round(base_score, 1)
-    finding["cvss_severity"]   = cvss_severity
-    finding["severity"]        = cvss_severity  # Sync severity with CVSS severity
+        score_source = "fallback"
+
+    # -----------------------------------------------------
+    # Calculate CVSS severity
+    # -----------------------------------------------------
+
+    cvss_severity = _score_to_severity(
+        base_score
+    )
+
+    # -----------------------------------------------------
+    # IMPORTANT:
+    #
+    # If there is no real CVSS information,
+    # preserve the scanner severity instead of changing it
+    # based on our fallback score.
+    # -----------------------------------------------------
+
+    if score_source == "fallback":
+
+        final_severity = original_severity
+
+    else:
+
+        final_severity = cvss_severity
+
+    # -----------------------------------------------------
+    # Store results
+    # -----------------------------------------------------
+
+    finding["cvss_base_score"] = round(
+        base_score,
+        1
+    )
+
+    finding["cvss_severity"] = cvss_severity
+
+    finding["severity"] = final_severity
+
+    finding["cvss_source"] = score_source
+
     return finding
 
 
-def score_all_findings(findings: List[Dict]) -> List[Dict]:
-    """Score all findings and return sorted by severity (highest first)."""
-    scored = [score_finding(f) for f in findings]
-    # Sort: CRITICAL → HIGH → MEDIUM → LOW → INFO based on CVSS score and severity
-    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-    scored.sort(key=lambda f: (
-        severity_order.get(str(f.get("severity", "INFO")).upper(), 4),
-        -f.get("cvss_base_score", 0)
-    ))
+# ---------------------------------------------------------
+# Score all findings
+# ---------------------------------------------------------
+
+def score_all_findings(
+    findings: List[Dict]
+) -> List[Dict]:
+    """
+    Score all findings and sort them from highest
+    severity/risk to lowest.
+    """
+
+    if not findings:
+        return []
+
+    scored = [
+        score_finding(finding)
+        for finding in findings
+    ]
+
+    scored.sort(
+        key=lambda finding: (
+            SEVERITY_ORDER.get(
+                str(
+                    finding.get(
+                        "severity",
+                        "INFO"
+                    )
+                ).upper(),
+                4
+            ),
+
+            -float(
+                finding.get(
+                    "cvss_base_score",
+                    0.0
+                )
+            ),
+        )
+    )
+
     return scored
 
 
-def calculate_overall_score(findings: List[Dict]) -> Dict[str, Any]:
+# ---------------------------------------------------------
+# Calculate overall score
+# ---------------------------------------------------------
+
+def calculate_overall_score(
+    findings: List[Dict]
+) -> Dict[str, Any]:
     """
-    Summarize the risk of all findings.
+    Calculate an overall summary of findings.
 
     Returns:
-        max_score     — Highest single CVSS base score found (0-10).
-        max_severity  — Severity label for that score.
-        total_risks   — Count of findings with severity != INFO.
-        counts        — Per-severity finding counts.
-        breakdown     — Per-severity max/avg score breakdown.
+
+        max_score
+            Highest CVSS score.
+
+        max_severity
+            Severity corresponding to max_score.
+
+        total_risks
+            Number of non-INFO findings.
+
+        counts
+            Number of findings for each severity.
+
+        breakdown
+            Count, maximum and average score for each severity.
     """
-    SEVERITY_KEYS = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+
+    severity_keys = [
+        "CRITICAL",
+        "HIGH",
+        "MEDIUM",
+        "LOW",
+        "INFO",
+    ]
+
+    # -----------------------------------------------------
+    # Empty result
+    # -----------------------------------------------------
 
     if not findings:
+
         return {
-            "max_score":        0.0,
-            "max_severity":     "INFO",
-            "total_risks":      0,
-            "counts":           {s: 0 for s in SEVERITY_KEYS},
-            "breakdown":        {},
+            "max_score": 0.0,
+            "max_severity": "INFO",
+            "total_risks": 0,
+            "counts": {
+                severity: 0
+                for severity in severity_keys
+            },
+            "breakdown": {},
         }
 
-    counts = {s: 0 for s in SEVERITY_KEYS}
-    scores_by_severity: Dict[str, List[float]] = {s: [] for s in SEVERITY_KEYS}
+    # -----------------------------------------------------
+    # Initialize counters
+    # -----------------------------------------------------
 
-    for f in findings:
-        sev   = str(f.get("severity", "INFO")).upper()
-        if sev not in counts:
-            sev = "INFO"
-        score = f.get("cvss_base_score", FALLBACK_SCORES.get(sev, 0.0))
-        counts[sev] += 1
-        scores_by_severity[sev].append(score)
+    counts = {
+        severity: 0
+        for severity in severity_keys
+    }
 
-    # Gather all non-zero scores sorted highest first
-    all_scores = sorted(
-        [s for sev, svscores in scores_by_severity.items()
-           for s in svscores if s > 0.0],
-        reverse=True,
+    scores_by_severity = {
+        severity: []
+        for severity in severity_keys
+    }
+
+    # -----------------------------------------------------
+    # Process findings
+    # -----------------------------------------------------
+
+    for finding in findings:
+
+        severity = str(
+            finding.get(
+                "severity",
+                "INFO"
+            )
+        ).upper()
+
+        if severity not in counts:
+            severity = "INFO"
+
+        # Get calculated score.
+        raw_score = finding.get(
+            "cvss_base_score",
+            None
+        )
+
+        try:
+
+            if raw_score is None:
+
+                score = FALLBACK_SCORES.get(
+                    severity,
+                    0.0
+                )
+
+            else:
+
+                score = float(
+                    raw_score
+                )
+
+        except (
+            ValueError,
+            TypeError
+        ):
+
+            score = FALLBACK_SCORES.get(
+                severity,
+                0.0
+            )
+
+        # Keep score inside CVSS range.
+        score = max(
+            0.0,
+            min(
+                10.0,
+                score
+            )
+        )
+
+        counts[severity] += 1
+        scores_by_severity[severity].append(
+            score
+        )
+
+    # -----------------------------------------------------
+    # Highest score
+    # -----------------------------------------------------
+
+    all_scores = [
+        score
+        for scores in scores_by_severity.values()
+        for score in scores
+        if score > 0.0
+    ]
+
+    if all_scores:
+
+        max_score = max(
+            all_scores
+        )
+
+    else:
+
+        max_score = 0.0
+
+    # -----------------------------------------------------
+    # Overall severity
+    # -----------------------------------------------------
+
+    max_severity = _score_to_severity(
+        max_score
     )
 
-    if not all_scores:
-        max_score = 0.0
-    else:
-        max_score = all_scores[0]
+    # -----------------------------------------------------
+    # Number of actual risks
+    # -----------------------------------------------------
 
-    max_severity = _score_to_severity(max_score)
-    
-    total_risks = sum(c for s, c in counts.items() if s != "INFO")
+    total_risks = sum(
+        counts[severity]
+        for severity in severity_keys
+        if severity != "INFO"
+    )
+
+    # -----------------------------------------------------
+    # Breakdown
+    # -----------------------------------------------------
 
     breakdown = {}
-    for sev, svscores in scores_by_severity.items():
-        if svscores:
-            breakdown[sev] = {
-                "count": len(svscores),
-                "max":   round(max(svscores), 1),
-                "avg":   round(sum(svscores) / len(svscores), 1),
-            }
+
+    for severity in severity_keys:
+
+        scores = scores_by_severity[
+            severity
+        ]
+
+        if not scores:
+            continue
+
+        breakdown[severity] = {
+            "count": len(scores),
+
+            "max": round(
+                max(scores),
+                1
+            ),
+
+            "avg": round(
+                sum(scores) / len(scores),
+                1
+            ),
+        }
+
+    # -----------------------------------------------------
+    # Return summary
+    # -----------------------------------------------------
 
     return {
-        "max_score":        round(max_score, 1),
-        "max_severity":     max_severity,
-        "total_risks":      total_risks,
-        "counts":           counts,
-        "breakdown":        breakdown,
+        "max_score": round(
+            max_score,
+            1
+        ),
+
+        "max_severity": max_severity,
+
+        "total_risks": total_risks,
+
+        "counts": counts,
+
+        "breakdown": breakdown,
     }
 
 
-def _score_to_severity(score: float) -> str:
-    """Convert CVSS base score to severity label."""
-    if score >= 9.0:  return "CRITICAL"
-    if score >= 7.0:  return "HIGH"
-    if score >= 4.0:  return "MEDIUM"
-    if score > 0.0:   return "LOW"
+# ---------------------------------------------------------
+# Convert CVSS score to severity
+# ---------------------------------------------------------
+
+def _score_to_severity(
+    score: float
+) -> str:
+    """
+    Convert CVSS v3 base score to severity.
+
+    CVSS v3 ranges:
+
+        9.0 - 10.0  CRITICAL
+        7.0 - 8.9   HIGH
+        4.0 - 6.9   MEDIUM
+        0.1 - 3.9   LOW
+        0.0         INFO
+    """
+
+    try:
+        score = float(score)
+
+    except (
+        ValueError,
+        TypeError
+    ):
+        return "INFO"
+
+    if score >= 9.0:
+        return "CRITICAL"
+
+    if score >= 7.0:
+        return "HIGH"
+
+    if score >= 4.0:
+        return "MEDIUM"
+
+    if score > 0.0:
+        return "LOW"
+
     return "INFO"
 
 
-def get_risk_label(score: float) -> str:
-    """Get a human-friendly risk label for an overall score."""
-    if score >= 9.0:  return "CRITICAL RISK"
-    if score >= 7.0:  return "HIGH RISK"
-    if score >= 4.0:  return "MEDIUM RISK"
-    if score >= 1.0:  return "LOW RISK"
+# ---------------------------------------------------------
+# Human-readable risk label
+# ---------------------------------------------------------
+
+def get_risk_label(
+    score: float
+) -> str:
+    """
+    Convert an overall score into a human-readable
+    risk label.
+    """
+
+    try:
+        score = float(score)
+
+    except (
+        ValueError,
+        TypeError
+    ):
+        return "INFORMATIONAL"
+
+    if score >= 9.0:
+        return "CRITICAL RISK"
+
+    if score >= 7.0:
+        return "HIGH RISK"
+
+    if score >= 4.0:
+        return "MEDIUM RISK"
+
+    if score > 0.0:
+        return "LOW RISK"
+
     return "INFORMATIONAL"
