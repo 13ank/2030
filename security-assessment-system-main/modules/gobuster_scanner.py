@@ -2,131 +2,71 @@
 modules/gobuster_scanner.py — Gobuster Integration
 Directory and file brute-forcing to discover hidden content.
 """
-
 import logging
 import os
 import re
 from typing import Dict, Any, List
+from urllib.parse import urlparse
 
 from modules.runner import run_tool
 import config
 
 logger = logging.getLogger("assessor.gobuster")
 
-
-# Paths/files that should be investigated when discovered.
-# Severity is intentionally conservative because Gobuster only
-# discovers paths; it does not prove that the resource is vulnerable.
+# Sensitive paths that indicate a finding if discovered
+# Scope: only patterns mapped to project's 8 in-scope risks
+# (Sensitive File/Directory Exposure, Exposed Admin Panels)
 SENSITIVE_PATH_PATTERNS = [
-    (
-        r"/(phpinfo|info\.php|test\.php|debug\.php)(/|$)",
-        "MEDIUM",
-        "PHP Info/Debug File Discovered",
-        "A PHP information or debug file was discovered and may expose server configuration."
-    ),
-    (
-        r"/\.env($|/)|/\.git($|/)|/\.svn($|/)|/\.hg($|/)|/\.htpasswd($|/)|/\.htaccess($|/)",
-        "MEDIUM",
-        "Sensitive File Discovered",
-        "A sensitive configuration or source-control path was discovered."
-    ),
-    (
-        r"/(config|configuration|settings|conf)\.(php|yml|yaml|json|xml|ini|env)$",
-        "MEDIUM",
-        "Configuration File Discovered",
-        "A configuration file was discovered and should be checked for sensitive information."
-    ),
-    (
-        r"/(backup|bak|old|archive|dump|db)\.",
-        "MEDIUM",
-        "Backup File Discovered",
-        "A possible backup or archive file was discovered."
-    ),
-    (
-        r"/(server-status|server-info)(/|$)",
-        "MEDIUM",
-        "Server Status Page Discovered",
-        "A server diagnostic page was discovered."
-    ),
-    (
-        r"/(upload|uploads)(/|$)",
-        "LOW",
-        "Upload Directory Discovered",
-        "An upload directory was discovered and should be checked for directory listing or unsafe file upload."
-    ),
-    (
-        r"/robots\.txt$",
-        "INFO",
-        "robots.txt Discovered",
-        "robots.txt was discovered and may reveal paths intended to be excluded from crawlers."
-    ),
-    (
-        r"/(crossdomain\.xml|clientaccesspolicy\.xml)$",
-        "LOW",
-        "Policy File Discovered",
-        "A cross-domain policy file was discovered and should be reviewed."
-    ),
-    (
-        r"/(wp-content|wp-includes|wp-login)(/|$)",
-        "LOW",
-        "WordPress Path Discovered",
-        "A WordPress installation path was discovered."
-    ),
-    (
-        r"/(phpmyadmin|pma|myadmin|sqladmin)(/|$)",
-        "MEDIUM",
-        "Database Management Path Discovered",
-        "A database management interface path was discovered."
-    ),
-    (
-        r"/(swagger|api-docs|openapi|graphql)(/|$)",
-        "LOW",
-        "API Documentation Discovered",
-        "An API documentation path was discovered and may reveal endpoints and data structures."
-    ),
-    (
-        r"\.(log|bak|sql|dump|tar|zip|gz|rar)$",
-        "MEDIUM",
-        "Potentially Sensitive File Discovered",
-        "A file with a potentially sensitive extension was discovered."
-    ),
+    (r"/(admin|administrator|management|manager|wp-admin|cp|controlpanel)", "CRITICAL",
+     "Admin panel discovered", "Administrative interface exposed without restriction."),
+    (r"/(phpinfo|info\.php|test\.php|debug\.php)", "HIGH",
+     "PHP Info/Debug File Exposed", "PHP info or debug file exposes server configuration."),
+    (r"/\.env|/\.git|/\.svn|/\.hg|/\.htpasswd|/\.htaccess", "HIGH",
+     "Sensitive File Exposed", "Sensitive configuration/source control file accessible."),
+    (r"/(backup|bak|old|archive|dump|db)\.", "HIGH",
+     "Backup/Archive File Found", "Backup file may contain sensitive data or source code."),
+    (r"/(config|configuration|settings|conf)\.(php|yml|yaml|json|xml|ini|env)", "HIGH",
+     "Configuration File Exposed", "Configuration file with potential secrets is publicly accessible."),
+    (r"/(phpmyadmin|pma|myadmin|sqladmin)", "CRITICAL",
+     "phpMyAdmin Panel Exposed", "Database management interface accessible without restriction."),
+    (r"\.(log|bak|sql|dump|tar|zip|gz|rar)$", "HIGH",
+     "Sensitive File Extension", "File with sensitive extension is publicly accessible."),
+]
+
+# Removed (out of project scope — not mapped to any of the 8 defined risks):
+#   crossdomain.xml / clientaccesspolicy.xml (Flash/Silverlight — obsolete tech)
+#   swagger / api-docs / openapi / graphql (API documentation exposure)
+#   wp-content / wp-includes / wp-login (CMS/WordPress fingerprinting)
+#   upload / uploads directory (not a defined finding category)
+#   robots.txt (not a vulnerability by itself)
+#   server-status / server-info / status / health / ping / actuator
+#     (belongs to Nmap/Nikto info-disclosure checks, not file/dir exposure)
+
+DIRECTORY_INDEX_MARKERS = [
+    "index of /",
+    "<title>index of",
+    "directory listing for",
 ]
 
 
 def scan(url: str, output_dir: str) -> Dict[str, Any]:
     """
-    Run Gobuster directory/file brute-force against the target URL.
+    Run Gobuster directory brute-force against the target URL.
     """
+    out_file  = os.path.join(output_dir, "gobuster_results.txt")
+    wordlist  = config.get_wordlist()
 
-    out_file = os.path.join(output_dir, "gobuster_results.txt")
-    wordlist = config.get_wordlist()
-
-    # Check wordlist
     if not os.path.exists(wordlist):
-        logger.warning(
-            f"[gobuster] Wordlist not found: {wordlist}"
-        )
-
+        logger.warning(f"[gobuster] Wordlist not found: {wordlist}")
         return {
-            "tool": "gobuster",
-            "status": "error",
-            "url": url,
-            "paths": [],
+            "tool":     "gobuster",
+            "status":   "error",
+            "url":      url,
             "findings": [],
+            "paths":    [],
             "raw_output": f"Wordlist not found: {wordlist}",
         }
 
-    # Remove previous output file so old results
-    # cannot be accidentally parsed.
-    if os.path.exists(out_file):
-        try:
-            os.remove(out_file)
-        except OSError:
-            logger.warning(
-                f"[gobuster] Could not remove old output file: {out_file}"
-            )
-
-    # Gobuster command
     cmd = [
         config.TOOL_PATHS["gobuster"],
         "dir",
@@ -134,311 +74,147 @@ def scan(url: str, output_dir: str) -> Dict[str, Any]:
         "-w", wordlist,
         "-o", out_file,
         "-x", config.GOBUSTER_EXTENSIONS,
-        "-t", "20",
+        "-t", "20",               # 20 threads
         "--no-progress",
         "--no-error",
-        "-q",
-        "-r",
+        "-q",                     # quiet mode
+        "-r",                     # follow redirects
         "--timeout", "10s",
     ]
 
-    logger.info(
-        f"[gobuster] Scanning {url}"
-    )
-
-    rc, stdout, stderr = run_tool(
-        cmd,
-        "gobuster",
-        timeout=config.TIMEOUTS["gobuster"]
-    )
-
-    # Determine status
-    if rc == 0:
-        status = "success"
-    elif rc == -1:
-        status = "timeout"
-    else:
-        status = "error"
+    rc, stdout, stderr = run_tool(cmd, "gobuster", timeout=config.TIMEOUTS["gobuster"])
 
     result = {
-        "tool": "gobuster",
-        "status": status,
-        "url": url,
-        "paths": [],
+        "tool":     "gobuster",
+        "status":   "success" if rc == 0 else ("timeout" if rc == -1 else "error"),
+        "url":      url,
+        "paths":    [],
         "findings": [],
         "raw_output": stdout + stderr,
     }
 
-    # Read Gobuster output
+    # Parse output file
     raw = ""
-
     if os.path.exists(out_file):
-        try:
-            with open(
-                out_file,
-                "r",
-                encoding="utf-8",
-                errors="replace"
-            ) as f:
-                raw = f.read()
-        except OSError as exc:
-            logger.warning(
-                f"[gobuster] Failed to read output: {exc}"
-            )
-
-    # Fall back to stdout
-    if not raw and stdout:
+        with open(out_file, "r", errors="replace") as f:
+            raw = f.read()
+    elif stdout:
         raw = stdout
 
-    # Parse discovered paths
-    result["paths"] = _parse_gobuster_output(raw)
+    result["paths"]    = _parse_gobuster_output(raw)
+    result["findings"] = _generate_findings(url, result["paths"])
 
-    # Generate findings
-    result["findings"] = _generate_findings(
-        url,
-        result["paths"]
-    )
+    # Directory indexing check runs separately against discovered
+    # directory-like paths (status 200/301/403 on a "/" style path)
+    index_findings = _check_directory_indexing(url, result["paths"])
+    result["findings"].extend(index_findings)
 
-    logger.info(
-        f"[gobuster] Found {len(result['paths'])} paths, "
-        f"{len(result['findings'])} findings"
-    )
-
+    logger.info(f"[gobuster] Found {len(result['paths'])} paths, "
+                f"{len(result['findings'])} sensitive findings")
     return result
 
 
 def _parse_gobuster_output(raw: str) -> List[Dict]:
     """
-    Parse Gobuster output.
-
-    Supported examples:
-
-        /admin              (Status: 200) [Size: 4096]
-        /config             (Status: 301) [Size: 312]
-        http://target/test  (Status: 200) [Size: 1234]
-
-    Returns:
-        [
-            {
-                "path": "/admin",
-                "status_code": 200,
-                "size": 4096
-            }
-        ]
+    Parse gobuster output lines.
+    Format: /path   (Status: 200) [Size: 1234]
+       or:  http://target/path (Status: 200) [Size: 1234]
     """
-
     paths = []
-
-    if not raw:
-        return paths
-
     pattern = re.compile(
-        r"""
-        (?:^|\s)
-        (?:
-            https?://[^/\s]+
-        )?
-        (?P<path>/[^?\s#]*)
-        \s+
-        \(Status:\s*(?P<status>\d+)\)
-        (?:.*?\[Size:\s*(?P<size>\d+)\])?
-        """,
-        re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+        r"(?:^|\s)(?:https?://[^/\s]+)?(/[^?\s#]*)\s+\(Status:\s*(\d+)\)(?:.*\[Size:\s*(\d+)\])?",
+        re.IGNORECASE | re.MULTILINE
     )
-
-    seen = set()
-
-    for match in pattern.finditer(raw):
-        path = match.group("path")
-        status_code = int(match.group("status"))
-        size_text = match.group("size")
-
-        size = int(size_text) if size_text else 0
-
-        # Keep interesting HTTP responses.
-        if status_code not in (
-            200,
-            204,
-            301,
-            302,
-            307,
-            308,
-            401,
-            403,
-        ):
-            continue
-
-        # Normalize path
-        if not path.startswith("/"):
-            path = "/" + path
-
-        # Remove duplicate trailing slashes
-        if path != "/" and path.endswith("//"):
-            path = path.rstrip("/")
-
-        key = (
-            path.lower(),
-            status_code,
-            size,
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        paths.append(
-            {
-                "path": path,
-                "status_code": status_code,
-                "size": size,
-            }
-        )
-
+    for m in pattern.finditer(raw):
+        path, code, size = m.group(1), int(m.group(2)), m.group(3)
+        if code in (200, 204, 301, 302, 307, 308, 401, 403):
+            paths.append({
+                "path":        path,
+                "status_code": code,
+                "size":        int(size) if size else 0,
+            })
     return paths
 
 
-def _generate_findings(
-    base_url: str,
-    paths: List[Dict]
-) -> List[Dict]:
+def _generate_findings(base_url: str, paths: List[Dict]) -> List[Dict]:
+    """Match discovered paths against sensitive patterns."""
+    findings = []
+    seen_titles = set()
+
+    for path_info in paths:
+        path = path_info["path"]
+        code = path_info["status_code"]
+        full_url = base_url.rstrip("/") + path
+
+        for pattern, severity, title, description in SENSITIVE_PATH_PATTERNS:
+            if re.search(pattern, path, re.IGNORECASE):
+                effective_severity = "INFO" if code in (401, 403) else severity
+                display_title      = f"{title} (Auth Required)" if code in (401, 403) else title
+
+                key = f"{display_title}:{path}"
+                if key not in seen_titles:
+                    seen_titles.add(key)
+                    findings.append({
+                        "tool":        "gobuster",
+                        "title":       display_title,
+                        "severity":    effective_severity,
+                        "description": description,
+                        "evidence":    f"HTTP {code}: {full_url}",
+                        "category":   "Directory/File Exposure",
+                        "cvss_vector": config.DEFAULT_CVSS_VECTORS.get(effective_severity, config.DEFAULT_CVSS_VECTORS["MEDIUM"]),
+                    })
+                break
+
+    return findings
+
+
+def _check_directory_indexing(base_url: str, paths: List[Dict]) -> List[Dict]:
     """
-    Generate findings from discovered Gobuster paths.
-
-    Important:
-    Gobuster discovers paths but does not prove that a resource
-    is vulnerable. Therefore:
-
-        200/204 -> resource appears accessible
-        301/302/307/308 -> resource discovered but redirected
-        401/403 -> resource discovered but access restricted
-
-    401/403 findings are therefore reported as INFO.
+    Verify directory indexing by fetching directory-like paths and
+    checking the response body for known "Index of /" markers.
+    Requires the `requests` library.
     """
+    try:
+        import requests
+    except ImportError:
+        logger.warning("[gobuster] 'requests' not installed, skipping directory indexing check")
+        return []
 
     findings = []
     seen = set()
 
     for path_info in paths:
+        path = path_info["path"]
+        code = path_info["status_code"]
 
-        path = path_info.get("path", "")
-        code = path_info.get("status_code", 0)
-
-        if not path:
+        # Only check directory-like paths that responded successfully
+        if code not in (200, 301, 302):
+            continue
+        if not path.endswith("/"):
             continue
 
-        # Construct target URL
         full_url = base_url.rstrip("/") + path
+        if full_url in seen:
+            continue
+        seen.add(full_url)
 
-        for (
-            pattern,
-            severity,
-            title,
-            description,
-        ) in SENSITIVE_PATH_PATTERNS:
+        try:
+            resp = requests.get(full_url, timeout=8, allow_redirects=True)
+        except requests.RequestException as e:
+            logger.debug(f"[gobuster] Directory index check failed for {full_url}: {e}")
+            continue
 
-            if not re.search(
-                pattern,
-                path,
-                re.IGNORECASE
-            ):
-                continue
+        body_lower = resp.text.lower() if resp.text else ""
 
-            # -------------------------------------------------
-            # Access restricted
-            # -------------------------------------------------
-            if code in (401, 403):
-
-                effective_severity = "INFO"
-
-                display_title = (
-                    f"{title} (Access Restricted)"
-                )
-
-                effective_description = (
-                    f"{description} "
-                    f"The server returned HTTP {code}, "
-                    f"so direct access was restricted."
-                )
-
-            # -------------------------------------------------
-            # Directly accessible
-            # -------------------------------------------------
-            elif code in (200, 204):
-
-                effective_severity = severity
-                display_title = title
-                effective_description = description
-
-            # -------------------------------------------------
-            # Redirect
-            # -------------------------------------------------
-            elif code in (301, 302, 307, 308):
-
-                effective_severity = "INFO"
-
-                display_title = (
-                    f"{title} (Redirect)"
-                )
-
-                effective_description = (
-                    f"{description} "
-                    f"The discovered path returned HTTP {code}; "
-                    f"direct exposure was not confirmed."
-                )
-
-            # -------------------------------------------------
-            # Other response
-            # -------------------------------------------------
-            else:
-
-                effective_severity = "INFO"
-                display_title = title
-                effective_description = description
-
-            # Avoid duplicate findings
-            key = (
-                display_title,
-                path.lower(),
-            )
-
-            if key in seen:
-                break
-
-            seen.add(key)
-
-            # CVSS vector
-            cvss_vectors = getattr(
-                config,
-                "DEFAULT_CVSS_VECTORS",
-                {}
-            )
-
-            default_vector = cvss_vectors.get(
-                "INFO",
-                ""
-            )
-
-            cvss_vector = cvss_vectors.get(
-                effective_severity,
-                default_vector
-            )
-
-            findings.append(
-                {
-                    "tool": "gobuster",
-                    "title": display_title,
-                    "severity": effective_severity,
-                    "description": effective_description,
-                    "evidence": (
-                        f"HTTP {code}: {full_url}"
-                    ),
-                    "category": "Directory/File Exposure",
-                    "cvss_vector": cvss_vector,
-                }
-            )
-
-            # One matching pattern per path
-            break
+        if any(marker in body_lower for marker in DIRECTORY_INDEX_MARKERS):
+            findings.append({
+                "tool":        "gobuster",
+                "title":       "Directory Indexing Enabled",
+                "severity":    "MEDIUM",
+                "description": "Directory listing is enabled, exposing the file structure of the server.",
+                "evidence":    f"HTTP {resp.status_code}: {full_url}",
+                "category":    "Directory/File Exposure",
+                "cvss_vector": config.DEFAULT_CVSS_VECTORS.get("MEDIUM", ""),
+            })
 
     return findings
