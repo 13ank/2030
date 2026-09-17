@@ -1,6 +1,17 @@
 """
 modules/nmap_scanner.py — Nmap Integration
 Port scanning + service detection + HTTP misconfiguration checks.
+
+Project scope covered by this module:
+- Missing HTTP Security Headers
+- Unnecessary Open Ports and Dangerous Services
+- Information Disclosure via Server Banners
+- Unsafe HTTP Methods
+
+Note: SSL/TLS certificate/protocol findings are intentionally NOT
+generated here. testssl_scanner.py is the single source of truth
+for the "Weak SSL/TLS and Cipher Configurations" risk to avoid
+duplicate findings between tools.
 """
 
 import xml.etree.ElementTree as ET
@@ -15,6 +26,26 @@ import config
 
 logger = logging.getLogger("assessor.nmap")
 
+# Ports relevant to "Unnecessary Open Ports and Dangerous Services"
+# in the project scope: unencrypted comms, database services, and
+# remote management interfaces.
+DANGEROUS_PORTS = {
+    21:    ("FTP", "HIGH", "Unencrypted file transfer service (FTP) is exposed."),
+    23:    ("Telnet", "CRITICAL", "Unencrypted remote administration service (Telnet) is exposed."),
+    1433:  ("MSSQL", "HIGH", "Microsoft SQL Server is directly reachable from the network."),
+    3306:  ("MySQL", "HIGH", "MySQL database service is directly reachable from the network."),
+    5432:  ("PostgreSQL", "HIGH", "PostgreSQL database service is directly reachable from the network."),
+    6379:  ("Redis", "HIGH", "Redis is directly reachable and may lack authentication by default."),
+    27017: ("MongoDB", "HIGH", "MongoDB is directly reachable and may lack authentication by default."),
+    3389:  ("RDP", "HIGH", "Remote Desktop Protocol (RDP) is exposed to the network."),
+    2375:  ("Docker API (unencrypted)", "CRITICAL", "Unencrypted Docker API exposes full host control."),
+    2376:  ("Docker API (TLS)", "MEDIUM", "Docker API exposed; verify TLS/client-cert enforcement."),
+    5900:  ("VNC", "HIGH", "VNC remote desktop service is exposed to the network."),
+}
+
+# Target ports to actively scan for (in addition to the web port itself).
+SCAN_PORT_LIST = "21,22,23,80,443,1433,2375,2376,3306,3389,5432,5900,6379,27017"
+
 
 def scan(url: str, output_dir: str) -> Dict[str, Any]:
     """
@@ -22,6 +53,7 @@ def scan(url: str, output_dir: str) -> Dict[str, Any]:
 
     Nmap checks:
         - Service/version detection
+        - Open ports / dangerous services
         - HTTP headers
         - HTTP methods
         - HTTP enumeration
@@ -33,19 +65,20 @@ def scan(url: str, output_dir: str) -> Dict[str, Any]:
 
     host = parsed.hostname or url
 
-    # Use port from target URL.
-    # If no port is specified, use standard HTTP/HTTPS port.
     if parsed.port:
-        port = parsed.port
+        web_port = parsed.port
     elif parsed.scheme == "https":
-        port = 443
+        web_port = 443
     else:
-        port = 80
+        web_port = 80
 
     out_xml = os.path.join(output_dir, "nmap_results.xml")
 
-    # Only scan the target port.
-    target_ports = str(port)
+    # Scan the web port plus the fixed list of commonly dangerous ports
+    # so open-port/dangerous-service findings can actually be generated.
+    port_set = set(int(p) for p in SCAN_PORT_LIST.split(","))
+    port_set.add(web_port)
+    target_ports = ",".join(str(p) for p in sorted(port_set))
 
     cmd = [
         config.TOOL_PATHS["nmap"],
@@ -73,7 +106,7 @@ def scan(url: str, output_dir: str) -> Dict[str, Any]:
         ),
         "url": url,
         "host": host,
-        "port": port,
+        "port": web_port,
         "open_ports": [],
         "services": [],
         "http_info": {},
@@ -81,9 +114,6 @@ def scan(url: str, output_dir: str) -> Dict[str, Any]:
         "raw_output": stdout + stderr,
     }
 
-    # ---------------------------------------------------------
-    # Parse XML
-    # ---------------------------------------------------------
     if os.path.exists(out_xml):
         try:
             result.update(_parse_nmap_xml(out_xml))
@@ -93,9 +123,6 @@ def scan(url: str, output_dir: str) -> Dict[str, Any]:
                 e
             )
 
-    # ---------------------------------------------------------
-    # Generate findings
-    # ---------------------------------------------------------
     result["findings"] = _generate_findings(result)
 
     logger.info(
@@ -172,9 +199,6 @@ def _parse_nmap_xml(xml_file: str) -> Dict[str, Any]:
                 "scripts": {},
             }
 
-            # -------------------------------------------------
-            # Parse Nmap scripts
-            # -------------------------------------------------
             for script in port.findall("script"):
 
                 sid = script.get("id", "")
@@ -211,8 +235,9 @@ def _parse_nmap_xml(xml_file: str) -> Dict[str, Any]:
                 elif sid == "http-apache-server-status":
                     http_info["apache_status"] = sout.strip()
 
-                elif sid == "ssl-cert":
-                    http_info["ssl_cert"] = _parse_ssl_cert(sout)
+                # NOTE: ssl-cert output is intentionally not parsed into
+                # a finding-generating field here. Certificate/TLS
+                # findings are owned by testssl_scanner.py.
 
             services.append(svc_info)
 
@@ -254,7 +279,6 @@ def _parse_http_methods(raw: str) -> List[str]:
 
     methods = []
 
-    # Look for common method names.
     possible_methods = {
         "GET",
         "HEAD",
@@ -277,34 +301,6 @@ def _parse_http_methods(raw: str) -> List[str]:
             methods.append(method)
 
     return sorted(set(methods))
-
-
-def _parse_ssl_cert(raw: str) -> Dict[str, str]:
-    """Extract basic SSL certificate information."""
-
-    info = {}
-
-    for line in raw.splitlines():
-
-        if "Subject:" in line:
-            info["subject"] = line.split(
-                "Subject:",
-                1
-            )[1].strip()
-
-        elif "Not valid after:" in line:
-            info["expires"] = line.split(
-                "Not valid after:",
-                1
-            )[1].strip()
-
-        elif "Issuer:" in line:
-            info["issuer"] = line.split(
-                "Issuer:",
-                1
-            )[1].strip()
-
-    return info
 
 
 def _parse_http_enum(raw: str) -> List[Dict[str, str]]:
@@ -381,6 +377,41 @@ def _generate_findings(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     headers = http_info.get("headers", {})
 
     # ---------------------------------------------------------
+    # Unnecessary Open Ports and Dangerous Services
+    # ---------------------------------------------------------
+    web_port = result.get("port")
+
+    for svc in services:
+        port = svc.get("port")
+
+        if port == web_port:
+            # Skip the web application's own port — that's the target
+            # being assessed, not an "unnecessary" exposed service.
+            continue
+
+        if port in DANGEROUS_PORTS:
+            service_label, severity, description = DANGEROUS_PORTS[port]
+
+            product = svc.get("product", "")
+            version = svc.get("version", "")
+            version_text = f" {product} {version}".strip()
+
+            findings.append({
+                "tool": "nmap",
+                "title": f"Unnecessary Open Port: {port}/{svc.get('proto', 'tcp')} ({service_label})",
+                "severity": severity,
+                "description": description,
+                "evidence": f"Port {port} open — service: {svc.get('name', 'unknown')}{(' - ' + version_text) if version_text.strip() else ''}",
+                "category": "Open Ports/Dangerous Services",
+                "cvss_vector": (
+                    config.DEFAULT_CVSS_VECTORS.get(
+                        severity,
+                        config.DEFAULT_CVSS_VECTORS["HIGH"]
+                    )
+                ),
+            })
+
+    # ---------------------------------------------------------
     # HTTP Methods
     # ---------------------------------------------------------
     dangerous_methods = {
@@ -424,8 +455,6 @@ def _generate_findings(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     # ---------------------------------------------------------
     # Security Headers
     # ---------------------------------------------------------
-    # Only check these headers when HTTP headers were actually
-    # returned by Nmap.
     if "headers" in http_info:
 
         security_headers = {
@@ -444,19 +473,8 @@ def _generate_findings(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "LOW",
                 "The response does not define Content-Security-Policy."
             ),
-            "referrer-policy": (
-                "Missing Referrer-Policy Header",
-                "LOW",
-                "The response does not define Referrer-Policy."
-            ),
-            "permissions-policy": (
-                "Missing Permissions-Policy Header",
-                "LOW",
-                "The response does not define Permissions-Policy."
-            ),
         }
 
-        # HSTS is meaningful for HTTPS.
         parsed_url = urlparse(
             result.get("url", "")
         )
@@ -496,7 +514,7 @@ def _generate_findings(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 })
 
     # ---------------------------------------------------------
-    # Server Version Disclosure
+    # Server Version / Technology Disclosure
     # ---------------------------------------------------------
     server = (
         http_info.get("server", "")
@@ -513,6 +531,24 @@ def _generate_findings(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "Server banner reveals software information."
             ),
             "evidence": f"Server: {server}",
+            "category": "Information Disclosure",
+            "cvss_vector": (
+                config.DEFAULT_CVSS_VECTORS["LOW"]
+            ),
+        })
+
+    x_powered_by = headers.get("x-powered-by", "")
+
+    if x_powered_by:
+
+        findings.append({
+            "tool": "nmap",
+            "title": f"X-Powered-By Header Disclosed: {x_powered_by}",
+            "severity": "LOW",
+            "description": (
+                "X-Powered-By header reveals backend technology/version information."
+            ),
+            "evidence": f"X-Powered-By: {x_powered_by}",
             "category": "Information Disclosure",
             "cvss_vector": (
                 config.DEFAULT_CVSS_VECTORS["LOW"]
@@ -538,8 +574,6 @@ def _generate_findings(result: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not path:
             continue
 
-        # Enumeration alone does NOT mean Critical.
-        # Use MEDIUM as a conservative baseline.
         severity = "MEDIUM"
         category = "Directory/File Exposure"
 
